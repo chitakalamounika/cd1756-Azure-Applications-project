@@ -1,128 +1,160 @@
-"""
-Routes and views for the flask application.
-"""
-
-from datetime import datetime
-from flask import render_template, flash, redirect, request, session, url_for
-from werkzeug.urls import url_parse
-from config import Config
-from FlaskWebProject import app, db
-from FlaskWebProject.forms import LoginForm, PostForm
-from flask_login import current_user, login_user, logout_user, login_required
-from FlaskWebProject.models import User, Post
-import msal
+import os
 import uuid
+from datetime import datetime
 
-imageSourceUrl = 'https://'+ app.config['BLOB_ACCOUNT']  + '.blob.core.windows.net/' + app.config['BLOB_CONTAINER']  + '/'
+from flask import render_template, request, redirect, url_for, flash, session
+from werkzeug.security import check_password_hash
 
-@app.route('/')
-@app.route('/home')
-@login_required
-def home():
-    user = User.query.filter_by(username=current_user.username).first_or_404()
-    posts = Post.query.all()
-    return render_template(
-        'index.html',
-        title='Home Page',
-        posts=posts
+from FlaskWebProject import app, db, login
+from FlaskWebProject.models import User, Article  # adjust if your model names differ
+
+# MSAL
+import msal
+from config import Config
+
+# ---------- Helpers ----------
+def _build_msal_app(cache=None):
+    return msal.ConfidentialClientApplication(
+        Config.CLIENT_ID,
+        authority=Config.AUTHORITY,
+        client_credential=Config.CLIENT_SECRET,
+        token_cache=cache,
     )
 
-@app.route('/new_post', methods=['GET', 'POST'])
-@login_required
-def new_post():
-    form = PostForm(request.form)
-    if form.validate_on_submit():
-        post = Post()
-        post.save_changes(form, request.files['image_path'], current_user.id, new=True)
-        return redirect(url_for('home'))
-    return render_template(
-        'post.html',
-        title='Create Post',
-        imageSource=imageSourceUrl,
-        form=form
+def _build_auth_url(scopes=None, state=None):
+    return _build_msal_app().get_authorization_request_url(
+        scopes or Config.SCOPE,
+        state=state or str(uuid.uuid4()),
+        redirect_uri=request.url_root.rstrip("/") + Config.REDIRECT_PATH,
     )
 
+# ---------- Routes ----------
+@login.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
 
-@app.route('/post/<int:id>', methods=['GET', 'POST'])
-@login_required
-def post(id):
-    post = Post.query.get(int(id))
-    form = PostForm(formdata=request.form, obj=post)
-    if form.validate_on_submit():
-        post.save_changes(form, request.files['image_path'], current_user.id)
-        return redirect(url_for('home'))
-    return render_template(
-        'post.html',
-        title='Edit Post',
-        imageSource=imageSourceUrl,
-        form=form
-    )
+@app.route("/")
+def index():
+    articles = Article.query.order_by(Article.id.desc()).all()
+    return render_template("index.html", articles=articles)
 
-@app.route('/login', methods=['GET', 'POST'])
+# ---- Local username/password form login (if present) ----
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if current_user.is_authenticated:
-        return redirect(url_for('home'))
-    form = LoginForm()
-    if form.validate_on_submit():
-        user = User.query.filter_by(username=form.username.data).first()
-        if user is None or not user.check_password(form.password.data):
-            flash('Invalid username or password')
-            return redirect(url_for('login'))
-        login_user(user, remember=form.remember_me.data)
-        next_page = request.args.get('next')
-        if not next_page or url_parse(next_page).netloc != '':
-            next_page = url_for('home')
-        return redirect(next_page)
-    session["state"] = str(uuid.uuid4())
-    auth_url = _build_auth_url(scopes=Config.SCOPE, state=session["state"])
-    return render_template('login.html', title='Sign In', form=form, auth_url=auth_url)
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
 
-@app.route(Config.REDIRECT_PATH)  # Its absolute URL must match your app's redirect_uri set in AAD
-def authorized():
-    if request.args.get('state') != session.get("state"):
-        return redirect(url_for("home"))  # No-OP. Goes back to Index page
-    if "error" in request.args:  # Authentication/Authorization failure
-        return render_template("auth_error.html", result=request.args)
-    if request.args.get('code'):
-        cache = _load_cache()
-        # TODO: Acquire a token from a built msal app, along with the appropriate redirect URI
-        result = None
-        if "error" in result:
-            return render_template("auth_error.html", result=result)
-        session["user"] = result.get("id_token_claims")
-        # Note: In a real app, we'd use the 'name' property from session["user"] below
-        # Here, we'll use the admin username for anyone who is authenticated by MS
-        user = User.query.filter_by(username="admin").first()
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            app.logger.warning("Invalid login attempt (unknown user) for '%s'", username)
+            flash("Invalid username or password", "danger")
+            return render_template("login.html")
+
+        # If you store hashed passwords, use check_password_hash
+        if hasattr(user, "password_hash") and user.password_hash:
+            ok = check_password_hash(user.password_hash, password)
+        else:
+            # demo fallback (NOT for production)
+            ok = (password == "admin")
+
+        if not ok:
+            app.logger.warning("Invalid login attempt (bad password) for '%s'", username)
+            flash("Invalid username or password", "danger")
+            return render_template("login.html")
+
+        # Successful local login
+        from flask_login import login_user
         login_user(user)
-        _save_cache(cache)
-    return redirect(url_for('home'))
+        app.logger.info("User '%s' logged in successfully (local)", username)
+        return redirect(url_for("index"))
 
-@app.route('/logout')
-def logout():
-    logout_user()
-    if session.get("user"): # Used MS Login
-        # Wipe out user and its token cache from session
-        session.clear()
-        # Also logout from your tenant's web session
-        return redirect(
-            Config.AUTHORITY + "/oauth2/v2.0/logout" +
-            "?post_logout_redirect_uri=" + url_for("login", _external=True))
+    return render_template("login.html")
 
-    return redirect(url_for('login'))
+# ---- Microsoft Sign-in button handler ----
+@app.route("/login-microsoft")
+def login_microsoft():
+    session["state"] = str(uuid.uuid4())
+    auth_url = _build_auth_url(state=session["state"])
+    app.logger.info("Redirecting to Microsoft login; state=%s", session["state"])
+    return redirect(auth_url)
 
-def _load_cache():
-    # TODO: Load the cache from `msal`, if it exists
-    cache = None
-    return cache
+# ---- MSAL redirect/callback ----
+@app.route(Config.REDIRECT_PATH)
+def authorized():
+    if request.args.get("state") != session.get("state"):
+        app.logger.warning("MS login failed: state mismatch")
+        return redirect(url_for("index"))
 
-def _save_cache(cache):
-    # TODO: Save the cache, if it has changed
-    pass
+    if "error" in request.args:
+        app.logger.warning("MS login error: %s - %s", request.args["error"], request.args.get("error_description"))
+        flash("Microsoft sign-in failed.", "danger")
+        return redirect(url_for("login"))
 
-def _build_msal_app(cache=None, authority=None):
-    # TODO: Return a ConfidentialClientApplication
-    return None
+    if "code" not in request.args:
+        app.logger.warning("MS login failed: no code in callback")
+        return redirect(url_for("login"))
 
-def _build_auth_url(authority=None, scopes=None, state=None):
-    # TODO: Return the full Auth Request URL with appropriate Redirect URI
-    return None
+    cache = msal.SerializableTokenCache()
+    result = _build_msal_app(cache=cache).acquire_token_by_authorization_code(
+        request.args["code"],
+        scopes=Config.SCOPE,
+        redirect_uri=request.url_root.rstrip("/") + Config.REDIRECT_PATH,
+    )
+
+    if "id_token_claims" not in result:
+        app.logger.warning("MS login failed: token acquisition error: %s", result.get("error_description"))
+        flash("Microsoft sign-in failed.", "danger")
+        return redirect(url_for("login"))
+
+    claims = result["id_token_claims"]
+    upn = claims.get("preferred_username") or claims.get("email") or "unknown"
+    name = claims.get("name") or upn
+    app.logger.info("MS login successful for '%s'", upn)
+
+    # Map/auto-provision to your User table if necessary
+    user = User.query.filter_by(username=upn).first()
+    if not user:
+        # Create a minimal user record; adjust fields to your model
+        user = User(username=upn, is_admin=True if "admin" in upn else False, password_hash="")
+        db.session.add(user)
+        db.session.commit()
+        app.logger.info("Provisioned new user from MS login: '%s'", upn)
+
+    from flask_login import login_user
+    login_user(user)
+    flash(f"Welcome, {name}!", "success")
+    return redirect(url_for("index"))
+
+# Example create article (ensure template/form names match)
+from flask_login import login_required, current_user
+from werkzeug.utils import secure_filename
+
+@app.route("/create", methods=["GET", "POST"])
+@login_required
+def create():
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        author = request.form.get("author", "").strip()
+        body = request.form.get("body", "").strip()
+
+        # Minimal server-side validation
+        if not title or not author or not body:
+            flash("All fields are required.", "warning")
+            return render_template("create.html")
+
+        # Optional image upload to Blob (if your template uses 'image' input)
+        image_file = request.files.get("image")
+        image_url = None
+        if image_file and image_file.filename:
+            from AzureStorage import upload_image  # if your repo has a helper; else implement
+            filename = secure_filename(image_file.filename)
+            image_url = upload_image(image_file.stream, filename)  # return public URL
+
+        a = Article(title=title, author=author, body=body, image_url=image_url, created_at=datetime.utcnow(), user_id=getattr(current_user, "id", 1))
+        db.session.add(a)
+        db.session.commit()
+        app.logger.info("Article created by '%s': %s", current_user.username, title)
+        return redirect(url_for("index"))
+
+    return render_template("create.html")
